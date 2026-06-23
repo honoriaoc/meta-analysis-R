@@ -1,0 +1,757 @@
+---
+title: "Fixed- and random-effects meta-analysis in R"
+subtitle: "A meta-analysis exercise - phytoestrogens and total cholesterol"
+author: "Biostatistics, Epidemiology and Public Health - University of Padova"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# Global chunk options
+
+knitr::opts_chunk$set(
+  echo = TRUE, # show the code (this is a teaching document)
+  message = FALSE, # hide package messages
+  warning = FALSE, # hide package warnings
+  fig.align = "center", # align figures
+  collapse = TRUE # collapses code and output together in the final documen
+)
+```
+
+# Research question
+
+> Does phytoestrogen improve levels of total blood cholesterol in
+> postmenopausal women?
+
+| PICO         | In this exercise                              |
+|--------------|-----------------------------------------------|
+| Population   | Postmenopausal women                          |
+| Intervention | Phytoestrogen                                 |
+| Outcome      | Total blood cholesterol (mmol/L)              |
+| Design       | Meta-analysis of randomized clinical trials   |
+
+Each trial gives **one** estimate of the effect; the meta-analysis pools these
+estimates into a single overall effect, giving more weight to the more precise
+trials (larger samples, smaller variability).
+
+# Effect measure
+
+Each trial reports, in every arm, the **change** in total cholesterol
+(follow-up − baseline).  
+Because the outcome is continuous and on the same scale
+(mmol/L), each trial is summarised by the **Mean Difference (MD)** between the
+two changes:
+
+$$\text{MD} = \text{Mean change}_{\text{intervention}} - \text{Mean change}_{\text{control}}
+\qquad (\Delta = \text{follow-up} - \text{baseline})$$
+
+Reading the sign of the MD:
+
+* `MD < 0` → **larger** reduction of cholesterol in the phytoestrogen group
+* `MD > 0` → **smaller** reduction (or an increase) in the phytoestrogen group
+* `MD = 0` → **same average** change in both groups
+
+# Packages
+
+A package is a collection of ready-made functions.  
+Install each one **once** per
+computer, then load it at the start of every session.
+
+```{r packages-install, eval=FALSE}
+# Run ONCE, then leave commented out:
+# install.packages(c("meta", "metafor", "tidyverse", "readxl"))
+```
+
+```{r packages-load}
+library(meta)        # meta-analysis functions: metacont, forest, funnel, metabias, metainf
+library(tidyverse)   # dplyr / readr / tibble: mutate, rename, near, the |> pipe
+library(readxl)      # read_excel(): read the .xlsx data file
+library(purrr)
+```
+
+The package `meta` contains all the functions used in this exercise, including:
+
+* `metacont()` for fixed- and random-effects meta-analysis
+* `forest()` for forest plots
+* `funnel()` and metabias() for publication bias assessment
+* `metainf()` for leave-one-out sensitivity analysis
+
+# Load and explore the data
+
+`read_excel()` (from **readxl**) loads the "MA exercise" workbook into a
+*tibble* - a modern data frame.  
+We read the sheet `"Total cholesterol"`, which contains the data used for the meta-analysis.  
+Each row corresponds to one randomized clinical trial.  
+The second sheet contains the data dictionary, describing the variables included in the dataset.
+
+```{r load-data}
+dat <- read_excel("data/MA_exercise.xlsx",
+                  sheet = "Total cholesterol")  # adjust the path if needed
+
+glimpse(dat)            # inspect variable names, types, and example values
+```
+
+`glimpse()` shows the structure of the dataset:
+- `<chr>` indicates character variables (text),
+- `<dbl>` indicates numeric variables
+
+Always check that variables have the expected type before starting the analysis.
+
+```{r}
+slice_head(dat, n = 6)  # display the first 6 rows of the dataset
+```
+
+# Understand the dataset
+
+The dataset contains 25 randomized clinical trials and 42 variables.
+For the meta-analysis we only need the study label, sample sizes, mean changes,
+and standard deviations. The remaining variables describe study characteristics
+(e.g. age, BMI, intervention type, duration, location, study quality) and may
+be useful later to explore heterogeneity.  
+Each row is one trial.  
+The study label arrives as `Author, Year of Publication`;
+we rename it to `study` in the next step.  
+For each arm the file stores the value
+at **baseline**, at **follow-up**, and the **change** between them:
+
+| Column(s) | Meaning |
+|-----------|---------|
+| `n_int`, `n_control` | Sample size of the intervention and control groups |
+| `int_base_mean`, `int_base_sd` | Mean and SD of total cholesterol at baseline, intervention group |
+| `int_final_mean`, `int_final_sd` | Mean and SD of total cholesterol at follow-up, intervention group |
+| `int_mean_diff`, `int_sd_diff` | Mean and SD of the change (follow-up − baseline), intervention group |
+| `cont_base_mean`, `cont_base_sd` | Mean and SD of total cholesterol at baseline, control group |
+| `cont_final_mean`, `cont_final_sd` | Mean and SD of total cholesterol at follow-up, control group |
+| `cont_mean_diff`, `cont_sd_diff` | Mean and SD of the change (follow-up − baseline), control group |
+
+The columns that actually enter the analysis are the **change** ones
+(`*_mean_diff`, `*_sd_diff`) plus the group sizes - the baseline/follow-up
+columns are kept so we can see where the change comes from.
+
+# Compute the study-specific effect size
+
+**Design choice (compute vs. pre-compute the MD).**  
+The file keeps the raw per-arm summary statistics because `metacont()` needs them to weight each trial
+by its precision.  
+The change scores `int_mean_diff` / `cont_mean_diff` are
+themselves pre/post differences (follow-up − baseline), so we can recompute them
+from the baseline/final columns and **check** they match.  
+We then form the
+study-level MD by hand, only to *see* the effect size and its sign - this `MD`
+column is **not** passed to `metacont()` (the function recomputes it internally).
+
+```{r compute-md}
+dat <- dat |>
+  rename(study = `Author, Year of Publication`) |>     # tidy the study-label column
+  mutate(
+    int_change  = int_final_mean  - int_base_mean,      # recompute the change, intervention arm
+    cont_change = cont_final_mean - cont_base_mean,      # recompute the change, control arm
+    MD          = int_mean_diff   - cont_mean_diff       # study effect size (understanding only)
+  )
+
+# Check our recomputed change matches the change score already in the file.
+# near() is a tolerant equality test (avoids a false FALSE from rounding).
+test <- dat |>
+  mutate(ok_int  = near(int_change,  int_mean_diff),
+         ok_cont = near(cont_change, cont_mean_diff)) |>
+  count(ok_int, ok_cont)                                 # ideally all TRUE
+
+# # Display the studies and visually inspect their calculated mean differences
+test1 <- dat |>
+  select(study, int_mean_diff, cont_mean_diff, MD) |>   # the building blocks of the MD
+  slice_head(n = 6)
+```
+
+Worked example - **Aubertin et al, 2007**:  
+change in the treated group $= -0.14$,  
+change in the control group $= -0.09$,  
+so $\text{MD} = -0.14 - (-0.09) = -0.05$ mmol/L.  
+The negative MD means the phytoestrogen group had a **larger reduction** in total cholesterol than the
+control group.
+
+> **Note.** Only the *means* can be recomputed as `follow-up − baseline`. The SD
+> of the change (`int_sd_diff` / `cont_sd_diff`) **cannot** be derived from the
+> baseline/final SDs without the pre/post correlation, so we use it as given.
+> The optional section below explains why.
+
+## Preparing the moderators (data cleaning)
+
+The covariate columns are typed by hand, so the labels are messy
+(`China` vs `China `, `usa` vs `USA`, a dozen spellings of *isoflavone*…).
+We tidy them once with **dplyr** before grouping — cleaning is part of the job.
+
+```{r prep-moderators}
+dat <- dat |>
+ mutate(
+    quality = factor(str_trim(`study quality`), levels = c("poor","fair","good")),
+    duration_wk  = duration12,
+    duration_grp = factor(if_else(duration12 > 12, "> 12 weeks", "<= 12 weeks")),
+    region  = recode(str_to_title(str_trim(location)), "Usa"="USA", "Uk"="UK"),
+    agegrp  = factor(Stratum1, labels = c("<=55 y", ">55 y")),
+    menop   = factor(Stratum3, labels = c("<= median", "> median")),
+    bmigrp  = factor(Stratum2, labels = c("<= median", "> median")),
+    admin   = factor(pills1dietary0, labels = c("Dietary", "Pills")),
+    health  = factor(healthy1, labels = c("With condition", "Healthy")),
+    smoking = factor(nonsmok1, labels = c("Smokers/mixed", "Non-smokers")),
+    ptype = factor(case_when(
+      str_detect(str_to_lower(type), "lignan|flax|sesame") ~ "Lignan",
+      str_detect(str_to_lower(type), "clover|coumestan")    ~ "Coumestan",
+      str_detect(str_to_lower(type), "iso|soy|genistein")   ~ "Isoflavone/soy",
+      TRUE                                                  ~ "Other"),
+      levels = c("Isoflavone/soy","Lignan","Coumestan","Other")),
+    baseline_tc = (int_base_mean*n_int + cont_base_mean*n_control) / (n_int + n_control)
+  )
+```
+
+
+```{r}
+dat <- dat |>
+  group_by(study) |>
+  mutate(study = if (n() > 1) paste0(study, " (", row_number(), ")") else study) |>
+  ungroup()
+```
+
+# Fixed-effects model
+
+`metacont()` is the meta-analysis of **cont**inuous outcomes.  
+It takes the per-arm summary statistics, computes each trial's MD and precision, and pools
+them.  
+The **fixed (common) effect** model assumes *one* single true effect shared by every trial; trials differ only by random sampling error, so larger /
+more precise trials get more weight.
+
+```{r fixed-model}
+# Fit a fixed-effect meta-analysis using the Mean Difference (MD)
+m_fixed <- metacont(
+  n.e     = n_int,           # n.e    = size of the Experimental (intervention) arm
+  mean.e  = int_mean_diff,   # mean.e = mean change, experimental (intervention) arm
+  sd.e    = int_sd_diff,     # sd.e   = SD of the change, experimental (intervention) arm
+  n.c     = n_control,       # n.c    = size of the Control arm
+  mean.c  = cont_mean_diff,  # mean.c = mean change, control arm
+  sd.c    = cont_sd_diff,    # sd.c   = SD of the change, control arm
+  studlab = study,           # studlab = label shown for each study
+  data    = dat,             # data    = the tibble holding the columns above
+  sm      = "MD",            # sm      = Summary Measure -> raw Mean Difference
+  # sm = "SMD"   # Standardized Mean Difference
+  # sm = "ROM"   # Ratio of Means
+  common  = TRUE,            # common  = TRUE  -> fit the FIXED (common) effect model
+  random  = FALSE,            # random  = FALSE -> skip the random-effects model here
+  method.tau = "DL"          
+)
+
+summary(m_fixed)             # pooled effect, 95% CI and heterogeneity statistics
+```
+
+**What is the pooled mean difference?**  
+The fixed-effect pooled mean difference is
+**`r sprintf("%.2f", m_fixed$TE.common)` mmol/L**.
+
+**Is the result statistically significant?**  
+Yes.  
+The 95% confidence interval ranges from
+**`r sprintf("%.2f", m_fixed$lower.common)`** to
+**`r sprintf("%.2f", m_fixed$upper.common)`**, and does not include 0.
+
+**What does the confidence interval tell us?**  
+The confidence interval is very narrow, indicating a precise estimate of the
+overall effect. Because the entire interval is below 0, the phytoestrogen group
+experienced a significantly greater reduction in total cholesterol than the
+control group.
+
+Under the fixed-effect model, larger and more precise studies receive more
+weight, so a single large study can have a substantial influence on the pooled
+estimate.
+
+## Forest plot (fixed-effect model)
+
+A forest plot is the standard picture of a meta-analysis: each trial is a square
+(its MD) with a horizontal line (its 95% CI); the square's size shows the
+trial's weight, and the diamond at the bottom is the pooled effect.
+
+```{r forest-fixed, fig.width=9, fig.height=11}
+# Forest plot:
+# - each square represents a study-specific effect estimate (MD)
+# - larger squares indicate studies with greater weight
+# - horizontal lines show the 95% confidence intervals
+# - the diamond represents the pooled effect estimate
+
+forest(m_fixed,
+       common      = TRUE,                  # draw the fixed-effect diamond
+       label.left  = "Favours treatment",   # text under the LEFT end of the axis
+       label.right = "Favours control",     # text under the RIGHT end of the axis
+       xlab        = "Mean difference in total cholesterol (mmol/L)",
+       leftcols    = c("studlab", "n.e", "n.c"),
+       leftlabs    = c("Study", "N (treat)", "N (ctrl)"))
+```
+
+**How to read the forest plot**
+
+- Each square represents the effect estimate from a single study.
+- Larger squares indicate studies that contribute more weight to the pooled estimate.
+- The horizontal line through each square is the 95% confidence interval.
+- The diamond at the bottom represents the pooled effect; its width corresponds to the 95% confidence interval.
+- The solid vertical line represents the line of no effect (MD = 0).
+- The dashed vertical line represents the pooled effect estimate from the meta-analysis.
+
+**Interpretation**
+
+Women receiving phytoestrogen supplementation experienced a greater reduction in
+total cholesterol than women in the control group.
+
+Under the fixed-effect model, we assume that all studies estimate the same true
+underlying effect and that observed differences between studies are due only to
+random sampling error.
+
+# Random-effects model
+
+The fixed-effect model assumes a single common effect.  
+We now relax this assumption and allow the true effect to vary across studies. 
+Same call, but we switch the model. The **random-effects** model assumes the
+true effect is *not* identical across trials but varies around an average
+(doses, types of phytoestrogen and populations differ). It adds the
+between-study variance $\tau^2$ to each weight, which usually **widens** the
+confidence interval.
+
+```{r random-model}
+# Fit a random-effects meta-analysis using the Mean Difference (MD)
+m_random <- metacont(
+  n.e     = n_int,
+  mean.e  = int_mean_diff,
+  sd.e    = int_sd_diff,
+  n.c     = n_control,
+  mean.c  = cont_mean_diff,
+  sd.c    = cont_sd_diff,
+  studlab = study,
+  data    = dat,
+  sm      = "MD",
+  common     = FALSE,        # common = FALSE -> skip the fixed-effect model
+  random     = TRUE,         # random = TRUE  -> fit the RANDOM-effects model
+  method.tau = "DL"          # method.tau = "DL" -> DerSimonian-Laird estimator of tau^2
+                             # (the default in 'meta' is REML; we use DL to match the exercise)
+                             # Only relevant for random-effects models, since fixed-effect models assume τ² = 0
+)
+
+summary(m_random) # pooled estimate, 95% CI, and heterogeneity statistics
+```
+
+**What is the pooled mean difference?**  
+The random-effects pooled mean difference is
+**`r sprintf("%.2f", m_random$TE.random)` mmol/L**.
+
+**Is the result statistically significant?**  
+Yes. The 95% confidence interval ranges from
+**`r sprintf("%.2f", m_random$lower.random)`** to
+**`r sprintf("%.2f", m_random$upper.random)`**, and does not include 0.
+
+**What does the confidence interval tell us?**  
+The confidence interval is wider than in the fixed-effect model because the
+random-effects model incorporates both within-study variability and
+between-study variability (heterogeneity). The entire interval remains below 0,
+indicating that the phytoestrogen group experienced a significantly greater
+reduction in total cholesterol than the control group.
+
+Unlike the fixed-effect model, the random-effects model assumes that the true
+effect may vary across studies and therefore provides an estimate of the average
+effect across a distribution of study-specific effects.
+
+**Compare the random-effects model with the fixed-effect model**
+
+**Is the pooled estimate different?**  
+Yes. The pooled estimate from the random-effects model is
+**`r sprintf("%.2f", m_random$TE.random)` mmol/L**, compared with
+**`r sprintf("%.2f", m_fixed$TE.common)` mmol/L** under the fixed-effect model.
+
+**Is the confidence interval wider or narrower?**  
+The confidence interval is wider under the random-effects model:
+**`r sprintf("%.2f", m_random$lower.random)` to `r sprintf("%.2f", m_random$upper.random)`**
+versus
+**`r sprintf("%.2f", m_fixed$lower.common)` to `r sprintf("%.2f", m_fixed$upper.common)`**
+for the fixed-effect model.
+
+**Why?**  
+The fixed-effect model assumes that all studies estimate the same true effect and
+accounts only for within-study variability. The random-effects model allows the
+true effect to vary across studies and incorporates both within-study and
+between-study variability (heterogeneity). As a result, uncertainty increases
+and the confidence interval becomes wider.
+
+## Forest plot (random-effect model)
+
+```{r forest-random, fig.width=9, fig.height=11}
+# Forest plot:
+# - each square represents a study-specific effect estimate (MD)
+# - larger squares indicate studies with greater weight
+# - horizontal lines show the 95% confidence intervals
+# - the diamond represents the pooled effect estimate
+forest(m_random,
+       random      = TRUE,                  # draw the random-effects diamond
+       label.left  = "Favours treatment",
+       label.right = "Favours control",
+       xlab        = "Mean difference in total cholesterol (mmol/L)",
+       leftcols    = c("studlab", "n.e", "n.c"),
+       leftlabs    = c("Study", "N (treat)", "N (ctrl)"))
+```
+
+**Interpretation**
+
+The random-effects model also suggests a beneficial effect of phytoestrogens on
+total cholesterol.
+
+However, unlike the fixed-effect model, it assumes that the true effect may vary
+across studies because populations, interventions and study settings differ. The
+pooled estimate therefore represents the average effect across a distribution of
+true effects.
+
+# Assess heterogeneity
+
+Heterogeneity measures how much the true effect varies between trials:
+
+* **Q** - Cochran's Q (total variation); its *p*-value tests whether the
+  differences exceed chance.
+* $\tau^2$ - estimated between-study variance (0 = the trials all agree).
+* $I^2$ - % of total variation that is real between-study difference rather than
+  chance. Rough guide: 0–25% low, 25–50% moderate, 50–75% substantial,
+  >75% considerable.
+
+```{r heterogeneity}
+# Display the main heterogeneity statistics:
+# - I²: percentage of variability due to heterogeneity
+# - τ²: between-study variance
+# - Q: Cochran's heterogeneity statistic
+# - p-value: test of whether heterogeneity exceeds chance
+
+cat("I-squared:", m_random$I2, "%\n")
+
+cat("Tau-squared:", round(m_random$tau2, 4), "\n") # τ² = estimated between-study variance
+
+cat("Cochran's Q:", round(m_random$Q, 1), "\n") # Q = Cochran's heterogeneity statistic
+
+cat("P-value for Q:", signif(m_random$pval.Q, 3), "\n")
+# p-value for the Q test; a small p-value suggests heterogeneity beyond chance
+```
+
+Here $I^2 \approx$ **`r sprintf("%.1f", m_random$I2 * 100)`%** - considerable
+heterogeneity. The trials genuinely differ, so the fixed-effect assumption of
+one shared effect is not credible.
+
+# Compare the two models
+
+| Fixed-effect                          | Random-effects                          |
+|---------------------------------------|-----------------------------------------|
+| Assumes one true effect               | Assumes different true effects          |
+| More weight to large studies          | More balanced weighting                 |
+| Narrower confidence interval          | Wider confidence interval               |
+| Appropriate when heterogeneity is low | Preferred when heterogeneity is present |
+
+For this analysis the **random-effects** model is more appropriate: the trials
+used different inclusion/exclusion criteria and different types/doses of
+phytoestrogen, and the high heterogeneity
+($I^2 \approx$ `r sprintf("%.1f", m_random$I2 * 100)`%) confirms the effect is
+not shared.
+
+
+# Publication bias
+
+Small studies with no effect are sometimes never published, biasing the pooled
+result. A funnel plot shows each trial's effect against its precision; without
+bias the points form a symmetric inverted funnel. `metabias()` tests that
+symmetry with Egger's regression test.
+
+```{r publication-bias, fig.width=7, fig.height=6}
+# Funnel plot: study effect size versus study precision
+# In the absence of publication bias, points should form a symmetric funnel
+funnel(m_random, studlab = FALSE)            # funnel plot (no per-point labels)
+```
+
+```{r}
+# Egger's regression test for funnel plot asymmetry
+# A small p-value suggests evidence of asymmetry
+metabias(m_random, method.bias = "Egger")    # Egger's test for funnel asymmetry
+```
+
+
+**How to interpret the results**
+
+- In the funnel plot, a symmetric inverted funnel suggests little evidence of publication bias.
+- Asymmetry may indicate publication bias, although other factors (e.g. heterogeneity or small-study effects) can also produce asymmetry.
+- Egger's test formally assesses funnel plot asymmetry.
+- A small p-value (commonly < 0.05) suggests evidence of asymmetry.
+
+Publication bias assessments should be interpreted cautiously, especially when
+the number of studies is small.
+
+# (Optional) Where do the change-score SDs come from?
+
+A paper rarely reports the SD of the change directly. Depending on what is
+reported, it is reconstructed in one of three ways. This is background for the
+curious - for the exercise itself we just use the `*_sd_diff` columns as given.
+
+```{r sd-methods}
+# METHOD 1 - Reported directly: the trial publishes the change and its SD.
+#            Nothing to compute; use the column as given.
+dat |> 
+  select(study, int_mean_diff, int_sd_diff) |> 
+  slice_head(n = 6)
+
+# METHOD 2 - Derived from the precision of the change (SE or 95% CI):
+#   from SE:     SD = SE * sqrt(n)
+#   from 95% CI: SD = sqrt(n) * (upper - lower) / (2 * 1.96)
+#   (illustrative only - these SE/CI columns are NOT in this dataset)
+# dat |>
+#   mutate(sd_from_se = int_change_se * sqrt(n_int),
+#          sd_from_ci = sqrt(n_int) * (int_change_ci_upp - int_change_ci_low) / (2 * 1.96))
+
+# METHOD 3 - Imputed from baseline & final SDs (needs a pre/post correlation r):
+#   SD_change = sqrt(SD_base^2 + SD_final^2 - 2*r*SD_base*SD_final)
+#   r is NOT in the data, so it is ASSUMED (Cochrane Handbook default: r = 0.5).
+r <- 0.5
+dat |>
+  mutate(sd_change_imp = sqrt(int_base_sd^2 + int_final_sd^2 -
+                              2 * r * int_base_sd * int_final_sd)) |>
+  select(study, int_sd_diff, sd_change_imp) |> slice_head(n = 6)
+```
+
+**Reverse check - what correlation is implied by this file?** Invert Method 3 to
+solve for `r`. A value outside `[-1, 1]` means the three SDs are *not* internally
+consistent with a standard pre/post calculation.
+
+```{r sd-reverse-check}
+dat |>
+  mutate(
+    r_int  = (int_base_sd^2  + int_final_sd^2  - int_sd_diff^2)  /
+             (2 * int_base_sd  * int_final_sd),
+    r_cont = (cont_base_sd^2 + cont_final_sd^2 - cont_sd_diff^2) /
+             (2 * cont_base_sd * cont_final_sd)
+  ) |>
+  select(study, r_int, r_cont) |> slice_head(n = 10)
+```
+
+In this dataset the implied correlations come out around 1 (some even above 1,
+which is impossible). So the change-score SDs are **not** internally consistent
+with the baseline/final SDs - they were obtained in another way, and we use them
+as provided rather than trying to reconstruct them. (A value above 1 is the data
+telling us something, not a mistake on our side.)
+
+
+
+# Take-home messages
+
+1. Fixed- and random-effects models rest on **different assumptions** - knowing
+   them tells you which fits your research question.
+2. They are interpreted differently: one true effect for all (fixed) vs. an
+   average of effects that vary across studies (random).
+3. Always inspect heterogeneity ($I^2$, $Q$, $\tau^2$): it guides **both** the
+   choice of model and the interpretation.
+
+**Answers to the exercise**
+
+* Fixed-effects result: MD = `r sprintf("%.2f", m_fixed$TE.common)` mmol/L
+  (95% CI `r sprintf("%.2f", m_fixed$lower.common)` to
+  `r sprintf("%.2f", m_fixed$upper.common)`).
+* Random-effects result: MD = `r sprintf("%.2f", m_random$TE.random)` mmol/L
+  (95% CI `r sprintf("%.2f", m_random$lower.random)` to
+  `r sprintf("%.2f", m_random$upper.random)`).
+* Same direction (cholesterol is lowered) but the random interval is wider.
+* Appropriate model: **random effects**, because heterogeneity is very high
+  ($I^2 \approx$ `r sprintf("%.1f", m_random$I2 * 100)`%).
+
+---
+
+# Investigating heterogeneity
+
+This section prepares the analyses presented in the follow-up
+lecture (*Dealing with Heterogeneity*) on the **same** dataset.
+These analyses are run on the random-effects model
+because that is the appropriate one here (I² ≈ 97.5%).
+
+
+## Subgroup analysis
+
+A subgroup analysis splits the trials into groups and asks whether the pooled
+effect **differs across groups**. The right tool is the **test for subgroup
+differences** (a between-group Q test), *not* eyeballing whether the
+subgroup CIs overlap.
+
+```{r subgroup-type}
+# Subgroup by age
+m_sub_age <- metacont(
+  n.e = n_int, 
+  mean.e = int_mean_diff, 
+  sd.e = int_sd_diff,
+  n.c = n_control, 
+  mean.c = cont_mean_diff, 
+  sd.c = cont_sd_diff,
+  studlab = study, 
+  data = dat, sm = "MD",
+  common = FALSE, 
+  random = TRUE, 
+  method.tau = "DL",
+  subgroup = agegrp, # subgroup = the grouping variable (a factor)
+  subgroup.name = "Median age, y" # subgroup.name = label shown in the output
+)
+
+
+m_sub_age        # read: per-subgroup MD, and the "Test for subgroup differences"
+```
+
+```{r}
+# Helper that runs ONE subgroup analysis for a given variable name `v`
+# and returns its results as a tidy one-row-per-subgroup table.
+run_sub <- function(v) {
+  m <- metacont(
+    n.e = n_int, mean.e = int_mean_diff, sd.e = int_sd_diff,
+    n.c = n_control, mean.c = cont_mean_diff, sd.c = cont_sd_diff,
+    studlab = study, data = dat, sm = "MD",
+    common = FALSE, random = TRUE, method.tau = "DL",
+    subgroup = .data[[v]],      # .data[[v]] = use the column whose name is in v
+    subgroup.name = v
+  )
+  # Pull the per-subgroup results out of the fitted object (the ".w" = within-subgroup)
+  tibble(
+    variable  = v,
+    subgroup  = m$bylevs,                       # the subgroup levels
+    k         = m$k.w,                          # number of studies in each subgroup
+    MD        = round(m$TE.random.w, 3),        # pooled MD within the subgroup
+    lower     = round(m$lower.random.w, 3),     # 95% CI lower bound
+    upper     = round(m$upper.random.w, 3),     # 95% CI upper bound
+    I2        = round(m$I2.w * 100, 1),         # residual heterogeneity within the subgroup
+    p_between = round(m$pval.Q.b.random, 3)     # test for subgroup differences (the key number)
+  )
+}
+```
+
+```{r}
+# Variables we want to test as subgroups (all are factors created above)
+group_vars <- c("ptype","duration_grp","quality","region",
+                "agegrp","menop","bmigrp","admin","health","smoking")
+
+# Run run_sub() on each, stacking the results into one table.
+# possibly() = if one variable fails (e.g. a single level), skip it instead of stopping.
+subgroup_table <- map_dfr(group_vars, possibly(run_sub, otherwise = NULL))
+print(subgroup_table, n = 100)   # the column that matters is p_between
+```
+
+
+```{r subgroup-forest, fig.width=9, fig.height=12}
+forest(m_sub_age)   # forest plot split by subgroup, with subgroup diamonds
+```
+## Meta-regression
+
+Meta-regression extends subgroup analysis to **continuous** moderators: it
+regresses the study effect on a study-level characteristic and asks whether that
+characteristic explains part of the heterogeneity. (Rule of thumb: only with
+≥ ~10 studies.)
+
+```{r metareg-baseline}
+# Does the effect depend on the trial's BASELINE cholesterol?
+# =====================================================================
+#  META-REGRESSION
+#  Does a continuous study-level characteristic explain the heterogeneity?
+#  (Rule of thumb: only with ~10+ studies.)
+# =====================================================================
+
+# --- (a) Baseline cholesterol -- the informative moderator -----------
+# Trials whose participants start higher: do they show a larger reduction?
+mr_base <- metareg(m_random, ~ baseline_tc)
+mr_base          # look at the slope, its p-value, and R^2 (heterogeneity explained)
+```
+
+```{r}
+# Bubble plot: each bubble = a study (size = precision), line = regression fit
+bubble(mr_base, studlab = FALSE,
+       xlab = "Baseline total cholesterol (mmol/L)",
+       ylab = "Mean difference (mmol/L)")
+
+```
+
+```{r}
+# --- (b) Duration -- a "clean" (non-coupled) moderator ---------------
+# Not coupled to the effect size, so no regression-to-the-mean artefact.
+mr_dur <- metareg(m_random, ~ duration_wk)
+mr_dur
+```
+
+```{r}
+# Bubble plot: each bubble = a study (size = precision), line = regression fit
+bubble(mr_dur, studlab = FALSE,
+       xlab = "Duration week",
+       ylab = "Mean difference (mmol/L)")
+```
+
+
+
+```{r}
+# --- (c) Age -- another non-coupled moderator ------------------------
+mr_age <- metareg(m_random, ~ Age)
+mr_age
+```
+
+```{r}
+# Bubble plot: each bubble = a study (size = precision), line = regression fit
+bubble(mr_age, studlab = FALSE,
+       xlab = "Age, year",
+       ylab = "Mean difference (mmol/L)")
+```
+
+
+**Interpretation** On these 25 trials, the only moderator with a signal is
+**baseline cholesterol**: trials starting from higher cholesterol tend to show a
+larger reduction (slope ≈ **−0.09** mmol/L per mmol/L, **p ≈ 0.11**, **R² ≈ 12%**).
+**Duration** and **age** do *not* explain the heterogeneity (slope ≈ 0, large p,
+R² ≈ 0%) — consistent with the paper, which found no duration effect in
+meta-regression despite the subgroup signal. Two important caveats: baseline
+cholesterol is **mathematically coupled** to the change (the effect is
+follow-up − baseline, so using baseline as predictor can induce *regression to
+the mean*); and meta-regression is **observational at the study level** — an
+association between study characteristics and effect, **not** proof of causation.
+
+
+
+
+## Sensitivity analysis
+
+A sensitivity analysis repeats the meta-analysis under **alternative reasonable
+choices**, to check the result is not driven by one decision or one study.
+
+```{r sens-leave-one-out, fig.width=9, fig.height=12}
+# 1) Leave-one-out: re-pool dropping one trial at a time
+# Sensitivity 1) Leave-one-out: re-pool the random-effects model 25 times,
+# each time dropping ONE trial, to see whether any single study drives the result.
+inf <- metainf(m_random, pooled = "random")
+
+inf            # numeric table: pooled MD with each study removed
+
+forest(inf)    # visual: if all rows line up, no single study is influential
+```
+
+```{r sens-exclude-quality}
+# Sensitivity 2) Restrict to higher-quality trials:
+# subset = keep only studies whose quality is not "poor", then re-pool.
+m_no_poor <- update(m_random, subset = (quality != "poor"))
+
+m_no_poor      # compare this pooled MD with the main one
+```
+
+```{r sens-estimator}
+# Sensitivity 3) Change the heterogeneity estimator (an "arbitrary" choice):
+# refit with REML instead of DerSimonian-Laird and compare side by side.
+m_reml <- update(m_random, method.tau = "REML")
+c(DL_MD   = m_random$TE.random, DL_low   = m_random$lower.random, DL_upp   = m_random$upper.random,
+  REML_MD = m_reml$TE.random,   REML_low = m_reml$lower.random,   REML_upp = m_reml$upper.random)
+```
+
+**How to read it:** if the pooled estimate and its significance stay essentially
+the same across all three checks (no single study flips it, excluding poor-quality
+trials doesn't change the message, DL ≈ REML), the conclusion is **robust** and
+can be reported with greater confidence.
+
+
+```{r session-info}
+sessionInfo()   # records package versions, so the report is reproducible
+```
